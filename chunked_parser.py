@@ -72,16 +72,6 @@ class ChunkedParser:
             return
 
         self.buffer.extend(data)
-
-        if len(self.buffer) > self._max_buffer_size and self.state in (
-            ChunkedState.READ_SIZE,
-            ChunkedState.READ_EXT,
-            ChunkedState.EXPECT_SIZE_CRLF,
-            ChunkedState.READ_TRAILER,
-        ):
-            self._set_error(ChunkedParserError("Buffer overflow in header parsing state"))
-            return
-
         self._process_buffer()
 
     def _process_buffer(self) -> None:
@@ -167,6 +157,9 @@ class ChunkedParser:
                 self.state = ChunkedState.EXPECT_SIZE_CRLF
                 self.buffer = self.buffer[i:]
                 return
+            if len(ext_bytes) >= self._max_buffer_size:
+                self._set_error(ChunkedParserError("Chunk extension too long"))
+                return
             ext_bytes.append(b)
             i += 1
 
@@ -227,13 +220,13 @@ class ChunkedParser:
             b = self.buffer[i]
             if b == ord(b"\r"):
                 line = self._current_trailer_line
-                self._current_trailer_line = b""
                 rest = self.buffer[i:]
                 if len(rest) < 2:
                     return
                 if rest[1] != ord(b"\n"):
                     self._set_error(ChunkedParserError("Malformed trailer line ending"))
                     return
+                self._current_trailer_line = b""
                 del self.buffer[:i + 2]
 
                 if line == b"":
@@ -242,11 +235,13 @@ class ChunkedParser:
                     self._parse_trailer_line(line)
                 return
             else:
-                self._current_trailer_line += bytes([b])
-                if len(self._current_trailer_line) > self._max_buffer_size:
+                if len(self._current_trailer_line) >= self._max_buffer_size:
                     self._set_error(ChunkedParserError("Trailer line too long"))
                     return
+                self._current_trailer_line += bytes([b])
                 i += 1
+        if i > 0:
+            del self.buffer[:i]
 
     def _parse_trailer_line(self, line: bytes) -> None:
         try:

@@ -56,8 +56,8 @@ class TestChunkedParserFragmented(unittest.TestCase):
 
     def test_hex_size_split_across_fragments(self):
         parser = ChunkedParser()
-        fragment1 = b"1"
-        fragment2 = b"0\r\n0123456789\r\n0\r\n\r\n"
+        fragment1 = b"A"
+        fragment2 = b"\r\n0123456789\r\n0\r\n\r\n"
         parser.feed(fragment1)
         self.assertFalse(parser.is_done)
         self.assertEqual(parser.state, ChunkedState.READ_SIZE)
@@ -67,19 +67,20 @@ class TestChunkedParserFragmented(unittest.TestCase):
 
     def test_hex_size_split_each_digit(self):
         parser = ChunkedParser()
-        data = b"1A\r\n0123456789ABCDEF\r\n0\r\n\r\n"
+        body = b"0123456789ABCDEF"
+        data = f"{len(body):X}\r\n".encode() + body + b"\r\n0\r\n\r\n"
         parser.feed(b"1")
         self.assertEqual(parser.state, ChunkedState.READ_SIZE)
-        parser.feed(b"A")
+        parser.feed(b"0")
         self.assertEqual(parser.state, ChunkedState.READ_SIZE)
         parser.feed(b"\r")
         self.assertEqual(parser.state, ChunkedState.EXPECT_SIZE_CRLF)
         parser.feed(b"\n")
         self.assertEqual(parser.state, ChunkedState.READ_DATA)
-        parser.feed(b"0123456789ABCDEF")
+        parser.feed(body)
         parser.feed(b"\r\n0\r\n\r\n")
         self.assertTrue(parser.is_done)
-        self.assertEqual(parser.body, b"0123456789ABCDEF")
+        self.assertEqual(parser.body, body)
 
     def test_crlf_after_size_split(self):
         parser = ChunkedParser()
@@ -101,31 +102,28 @@ class TestChunkedParserFragmented(unittest.TestCase):
         parser = ChunkedParser()
         parser.feed(b"10\r\n012345")
         self.assertEqual(parser.state, ChunkedState.READ_DATA)
+        self.assertEqual(parser.current_chunk_size, 10)
         parser.feed(b"6789ABCDEF")
-        self.assertEqual(parser.state, ChunkedState.READ_DATA)
+        self.assertEqual(parser.state, ChunkedState.EXPECT_DATA_CRLF)
+        self.assertEqual(parser.current_chunk_size, 0)
         parser.feed(b"\r\n0\r\n\r\n")
         self.assertTrue(parser.is_done)
         self.assertEqual(parser.body, b"0123456789ABCDEF")
 
     def test_everything_split(self):
         parser = ChunkedParser()
-        chunks = [
-            b"2",
-            b"3",
+        body = b"Hello World!"
+        size_hex = f"{len(body):X}".encode()
+        chunks = []
+        for byte in size_hex:
+            chunks.append(bytes([byte]))
+        chunks.extend([
             b"\r",
             b"\n",
-            b"H",
-            b"e",
-            b"l",
-            b"l",
-            b"o",
-            b" ",
-            b"W",
-            b"o",
-            b"r",
-            b"l",
-            b"d",
-            b"!",
+        ])
+        for byte in body:
+            chunks.append(bytes([byte]))
+        chunks.extend([
             b"\r",
             b"\n",
             b"0",
@@ -133,13 +131,13 @@ class TestChunkedParserFragmented(unittest.TestCase):
             b"\n",
             b"\r",
             b"\n",
-        ]
+        ])
         for i, chunk in enumerate(chunks):
             parser.feed(chunk)
             if i < len(chunks) - 1:
                 self.assertFalse(parser.is_done)
         self.assertTrue(parser.is_done)
-        self.assertEqual(parser.body, b"Hello World!")
+        self.assertEqual(parser.body, body)
 
 
 class TestChunkedParserExtensions(unittest.TestCase):
@@ -206,24 +204,21 @@ class TestChunkedParserTrailers(unittest.TestCase):
 
 
 class TestChunkedParserSecurity(unittest.TestCase):
-    def test_huge_chunk_size_declaration(self):
+    def test_0xffffffff_malicious_chunk_declaration_only(self):
         parser = ChunkedParser(max_chunk_size=1024)
-        data = b"FFFFFFFF\r\n" + b"A" * 0xFFFFFFFF
-        parser.feed(data)
+        parser.feed(b"FFFFFFFF\r\n")
         self.assertTrue(parser.is_error)
         self.assertIsInstance(parser.error, ChunkSizeLimitExceeded)
 
     def test_0xffffffff_malicious_chunk(self):
         parser = ChunkedParser(max_chunk_size=1024 * 1024)
-        data = b"FFFFFFFF\r\n"
-        parser.feed(data)
+        parser.feed(b"FFFFFFFF\r\n")
         self.assertTrue(parser.is_error)
         self.assertIsInstance(parser.error, ChunkSizeLimitExceeded)
 
     def test_very_long_hex_digits(self):
         parser = ChunkedParser()
-        data = b"123456789ABCDEF\r\n"
-        parser.feed(data)
+        parser.feed(b"123456789ABCDEF\r\n")
         self.assertTrue(parser.is_error)
         self.assertIsInstance(parser.error, ChunkSizeLimitExceeded)
 
@@ -234,40 +229,35 @@ class TestChunkedParserSecurity(unittest.TestCase):
         self.assertTrue(parser.is_error)
         self.assertIsInstance(parser.error, TotalSizeLimitExceeded)
 
-    def test_buffer_overflow_in_size_state(self):
-        parser = ChunkedParser(max_buffer_size=10)
-        data = b"12345678901234567890"
-        parser.feed(data)
+    def test_long_hex_digits_trigger_size_limit(self):
+        parser = ChunkedParser()
+        parser.feed(b"1234567890")
         self.assertTrue(parser.is_error)
+        self.assertIsInstance(parser.error, ChunkSizeLimitExceeded)
 
     def test_buffer_overflow_in_ext_state(self):
         parser = ChunkedParser(max_buffer_size=10)
-        data = b"4;ext12345678901234567890"
-        parser.feed(data)
+        parser.feed(b"4;ext12345678901234567890")
         self.assertTrue(parser.is_error)
 
     def test_buffer_overflow_in_trailer_state(self):
         parser = ChunkedParser(max_buffer_size=10)
-        data = b"0\r\nVeryLongTrailerHeader: value\r\n\r\n"
-        parser.feed(data)
+        parser.feed(b"0\r\nVeryLongTrailerHeader: value\r\n\r\n")
         self.assertTrue(parser.is_error)
 
     def test_invalid_character_in_size(self):
         parser = ChunkedParser()
-        data = b"G\r\ntest\r\n0\r\n\r\n"
-        parser.feed(data)
+        parser.feed(b"G\r\ntest\r\n0\r\n\r\n")
         self.assertTrue(parser.is_error)
 
     def test_empty_chunk_size(self):
         parser = ChunkedParser()
-        data = b"\r\ntest\r\n0\r\n\r\n"
-        parser.feed(data)
+        parser.feed(b"\r\ntest\r\n0\r\n\r\n")
         self.assertTrue(parser.is_error)
 
     def test_missing_crlf_after_data(self):
         parser = ChunkedParser()
-        data = b"4\r\nWikiX\r\n0\r\n\r\n"
-        parser.feed(data)
+        parser.feed(b"4\r\nWikiX\r\n0\r\n\r\n")
         self.assertTrue(parser.is_error)
 
 
@@ -285,6 +275,37 @@ class TestChunkedParserEdgeCases(unittest.TestCase):
         parser.feed(data)
         self.assertTrue(parser.is_done)
         self.assertEqual(len(parser.body), size)
+
+    def test_single_feed_large_chunk_exceeds_default_header_buffer(self):
+        default_header_buffer = 4096
+        body_size = default_header_buffer + 1024
+        parser = ChunkedParser(
+            max_chunk_size=body_size + 1000,
+            max_total_size=body_size + 1000,
+        )
+        header = f"{body_size:X}\r\n".encode()
+        body = b"X" * body_size
+        trailer = b"\r\n0\r\n\r\n"
+        full_data = header + body + trailer
+        parser.feed(full_data)
+        self.assertTrue(parser.is_done, f"解析失败: state={parser.state}, error={parser.error}")
+        self.assertEqual(len(parser.body), body_size)
+        self.assertEqual(parser.body[:5], b"XXXXX")
+        self.assertEqual(parser.body[-5:], b"XXXXX")
+
+    def test_single_feed_10kb_chunk(self):
+        body_size = 10 * 1024
+        parser = ChunkedParser(
+            max_chunk_size=1024 * 1024,
+            max_total_size=1024 * 1024,
+        )
+        header = f"{body_size:X}\r\n".encode()
+        body = bytes([i % 256 for i in range(body_size)])
+        trailer = b"\r\n0\r\n\r\n"
+        full_data = header + body + trailer
+        parser.feed(full_data)
+        self.assertTrue(parser.is_done, f"解析失败: state={parser.state}, error={parser.error}")
+        self.assertEqual(len(parser.body), body_size)
 
     def test_feed_after_done(self):
         parser = ChunkedParser()
@@ -313,6 +334,60 @@ class TestChunkedParserEdgeCases(unittest.TestCase):
         self.assertEqual(len(parser.chunks), 2)
         self.assertEqual(parser.chunks[0], b"Hello")
         self.assertEqual(parser.chunks[1], b" World")
+
+
+class TestChunkedParserTrailerSplitEdgeCases(unittest.TestCase):
+    def test_trailer_value_and_crlf_completely_split(self):
+        parser = ChunkedParser()
+        parser.feed(b"4\r\nWiki\r\n0\r\nTrailer: value")
+        self.assertEqual(parser.state, ChunkedState.READ_TRAILER)
+        parser.feed(b"\r")
+        self.assertEqual(parser.state, ChunkedState.READ_TRAILER)
+        parser.feed(b"\n")
+        self.assertEqual(parser.state, ChunkedState.READ_TRAILER)
+        parser.feed(b"\r")
+        self.assertEqual(parser.state, ChunkedState.READ_TRAILER)
+        parser.feed(b"\n")
+        self.assertTrue(parser.is_done)
+        self.assertEqual(parser.trailers["trailer"], "value")
+        self.assertEqual(parser.body, b"Wiki")
+
+    def test_trailer_value_split_then_crlf_split(self):
+        parser = ChunkedParser()
+        parser.feed(b"4\r\nWiki\r\n0\r\nTra")
+        parser.feed(b"iler: test")
+        parser.feed(b"\r")
+        parser.feed(b"\n")
+        parser.feed(b"\r")
+        parser.feed(b"\n")
+        self.assertTrue(parser.is_done)
+        self.assertEqual(parser.trailers["trailer"], "test")
+        self.assertEqual(parser.body, b"Wiki")
+
+    def test_multiple_trailers_all_split(self):
+        parser = ChunkedParser()
+        parser.feed(b"4\r\nWiki\r\n0\r\n")
+        parser.feed(b"X-One: 1")
+        parser.feed(b"\r")
+        parser.feed(b"\n")
+        parser.feed(b"X-Two: 2")
+        parser.feed(b"\r")
+        parser.feed(b"\n")
+        parser.feed(b"\r")
+        parser.feed(b"\n")
+        self.assertTrue(parser.is_done)
+        self.assertEqual(parser.trailers["x-one"], "1")
+        self.assertEqual(parser.trailers["x-two"], "2")
+
+    def test_final_empty_trailer_line_split(self):
+        parser = ChunkedParser()
+        parser.feed(b"4\r\nWiki\r\n0\r\nSome: thing\r\n")
+        self.assertEqual(parser.state, ChunkedState.READ_TRAILER)
+        parser.feed(b"\r")
+        self.assertEqual(parser.state, ChunkedState.READ_TRAILER)
+        parser.feed(b"\n")
+        self.assertTrue(parser.is_done)
+        self.assertEqual(parser.trailers["some"], "thing")
 
 
 if __name__ == "__main__":
